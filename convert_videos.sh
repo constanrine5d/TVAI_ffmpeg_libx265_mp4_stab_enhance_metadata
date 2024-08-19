@@ -52,7 +52,7 @@ while IFS= read -r FILE; do
 
     # Add the file size to the total size
     TOTAL_VIDEO_SIZE_ORIGINAL=$((TOTAL_VIDEO_SIZE_ORIGINAL + FILE_SIZE))
-done < <(find "$CURRENT_DIR" -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" \))
+done < <(find "$CURRENT_DIR" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" \))
 
 # Convert total size to gigabytes
 TOTAL_VIDEO_SIZE_ORIGINAL_GB=$(echo "scale=2; $TOTAL_VIDEO_SIZE_ORIGINAL / (1024^3)" | bc)
