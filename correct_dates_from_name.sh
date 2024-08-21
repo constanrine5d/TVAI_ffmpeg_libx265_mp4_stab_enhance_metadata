@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+exiftool=/usr/local/bin/exiftool
+
 # Resolve script's current directory
 SOURCE=${BASH_SOURCE[0]}
 while [ -L "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
