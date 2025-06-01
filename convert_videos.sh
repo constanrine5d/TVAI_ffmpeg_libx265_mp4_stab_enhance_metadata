@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -e
 
 # Resolve script's current directory
 SOURCE=${BASH_SOURCE[0]}
@@ -24,8 +24,8 @@ read
 
 # Set FFMPEG locations
 topaz_ffmpeg="/Applications/Topaz Video AI.app/Contents/MacOS/ffmpeg"
-homebrew_ffmpeg="/usr/local/bin/ffmpeg"
-exiftool="/usr/local/bin/exiftool"
+homebrew_ffmpeg="/opt/homebrew/bin/ffmpeg"
+exiftool="/opt/homebrew/bin/exiftool"
 
 export TVAI_MODEL_DIR="/Applications/Topaz Video AI.app/Contents/Resources/models"
 export TVAI_MODEL_DATA_DIR="/Applications/Topaz Video AI.app/Contents/Resources/models"
@@ -36,23 +36,65 @@ echo -e "Homebrew FFmpeg path: $homebrew_ffmpeg\n\n"
 # Initialize total video size variable
 TOTAL_VIDEO_SIZE_ORIGINAL=0
 
-# Initialize an array to store video file paths
+# Initialize arrays to store video file paths and their sizes
 VIDEO_FILES=()
+VIDEO_SIZES=()
 
-# Find all video files and process each one
+# Find all video files and collect their information
+echo -e "${BLUE}Scanning video files...${NOCOLOR}\n"
 while IFS= read -r FILE; do
-    # Add the file to the array
-    VIDEO_FILES+=("$FILE")
-
     # Get the file size in bytes
     FILE_SIZE=$(wc -c < "$FILE")
-
-    # Print the file size
-    echo "File: $(basename "$FILE"), Size: $(echo "scale=2; $FILE_SIZE / (1024^3)" | bc) GB"
-
+    
+    # Add the file and its size to the arrays
+    VIDEO_FILES+=("$FILE")
+    VIDEO_SIZES+=("$FILE_SIZE")
+    
     # Add the file size to the total size
     TOTAL_VIDEO_SIZE_ORIGINAL=$((TOTAL_VIDEO_SIZE_ORIGINAL + FILE_SIZE))
 done < <(find "$CURRENT_DIR" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" \))
+
+# Sort files by size (smaller to larger)
+echo -e "${BLUE}Sorting files by size (smaller to larger)...${NOCOLOR}\n"
+
+# Create an array of indices
+INDICES=()
+for i in "${!VIDEO_FILES[@]}"; do
+    INDICES+=("$i")
+done
+
+# Sort indices based on file sizes (bubble sort for simplicity)
+for ((i = 0; i < ${#INDICES[@]}; i++)); do
+    for ((j = i + 1; j < ${#INDICES[@]}; j++)); do
+        idx1=${INDICES[i]}
+        idx2=${INDICES[j]}
+        if [[ ${VIDEO_SIZES[idx1]} -gt ${VIDEO_SIZES[idx2]} ]]; then
+            # Swap indices
+            temp=${INDICES[i]}
+            INDICES[i]=${INDICES[j]}
+            INDICES[j]=$temp
+        fi
+    done
+done
+
+# Create sorted arrays
+SORTED_VIDEO_FILES=()
+SORTED_VIDEO_SIZES=()
+for idx in "${INDICES[@]}"; do
+    SORTED_VIDEO_FILES+=("${VIDEO_FILES[idx]}")
+    SORTED_VIDEO_SIZES+=("${VIDEO_SIZES[idx]}")
+done
+
+# Print sorted files with their sizes
+echo -e "${BLUE}Files sorted by size:${NOCOLOR}\n"
+for i in "${!SORTED_VIDEO_FILES[@]}"; do
+    FILE="${SORTED_VIDEO_FILES[i]}"
+    FILE_SIZE="${SORTED_VIDEO_SIZES[i]}"
+    echo "File: $(basename "$FILE"), Size: $(echo "scale=2; $FILE_SIZE / (1024^3)" | bc) GB"
+done
+
+# Update VIDEO_FILES to use the sorted array
+VIDEO_FILES=("${SORTED_VIDEO_FILES[@]}")
 
 # Convert total size to gigabytes
 TOTAL_VIDEO_SIZE_ORIGINAL_GB=$(echo "scale=2; $TOTAL_VIDEO_SIZE_ORIGINAL / (1024^3)" | bc)
