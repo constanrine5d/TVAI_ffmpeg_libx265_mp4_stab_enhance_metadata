@@ -89,6 +89,13 @@ probe_audio_stream_count() {
   count=$(probe_audio_channels_list "$1" | awk 'NF { count++ } END { print count + 0 }')
   printf '%d\n' "$count"
 }
+has_attached_thumbnail() {
+  local count
+  count=$("$ffprobe_bin" -v error -select_streams v \
+    -show_entries stream_disposition=attached_pic -of csv=p=0 "$1" 2>/dev/null |
+    awk '$1 == 1 { count++ } END { print count + 0 }')
+  [[ "$count" -gt 0 ]]
+}
 
 # ---- Time helpers for estimates ----
 fmt_hms() {
@@ -191,6 +198,10 @@ is_output_complete() {
     done
   fi
 
+  # A completed output must include the generated poster frame.
+  has_attached_thumbnail "$output" ||
+    { echo "  [DEBUG] Attached thumbnail missing" >&2; return 1; }
+
   # Check modification time
   local mt_in=$(get_mtime "$input") mt_out=$(get_mtime "$output")
   [[ "$mt_in" == "$mt_out" ]] || { echo "  [DEBUG] mtime mismatch: in=$mt_in out=$mt_out" >&2; return 1; }
@@ -213,6 +224,45 @@ fix_timestamps_and_metadata() {
   "$exiftool_bin" -ee -overwrite_original -api largefilesupport=1 -TagsFromFile "$input" "-FileCreateDate<FileCreateDate" "-FileModifyDate<FileModifyDate" "$output" >/dev/null 2>&1 || true
   # Force filesystem timestamps to match input file
   touch -r "$input" "$output" 2>/dev/null || true
+}
+
+attach_thumbnail() {
+  local input="$1" output="$2" error_log="$3"
+  local file_number="$4"
+  local temp_thumb="${output%.mp4}_thumb.jpg"
+  local temp_output="${output%.mp4}_temp.mp4"
+
+  : > "$error_log"
+  render_postprocess_stage "$input" "$file_number" "Generating thumbnail"
+  if ! "$ffmpeg_bin" -y -hide_banner -loglevel error \
+    -i "$input" -vframes 1 -q:v 2 "$temp_thumb" 2>>"$error_log"; then
+    return 1
+  fi
+
+  render_postprocess_stage "$input" "$file_number" "Attaching thumbnail"
+  # Select supported streams explicitly. `-map 0` also selects camera tmcd
+  # data tracks as codec `none`, which cannot be copied into the new MP4.
+  if ! "$ffmpeg_bin" -y -hide_banner -loglevel error \
+    -i "$output" -i "$temp_thumb" \
+    -map 0:v:0 -map '0:a?' -map '0:s?' -map 1:v:0 \
+    -map_metadata 0 -map_chapters 0 \
+    -c copy -tag:v:0 hvc1 -disposition:v:1 attached_pic \
+    -movflags +faststart \
+    "$temp_output" 2>>"$error_log"; then
+    rm -f "$temp_output"
+    return 1
+  fi
+
+  if [[ ! -s "$temp_output" ]]; then
+    printf 'Thumbnail remux produced an empty output. input=%s output=%s\n' \
+      "$input" "$output" >>"$error_log"
+    rm -f "$temp_output"
+    return 1
+  fi
+
+  mv "$temp_output" "$output"
+  rm -f "$temp_thumb" "$error_log"
+  return 0
 }
 
 # ---- CLI Args ----
@@ -706,6 +756,34 @@ for idx in "${!VIDEO_FILES[@]}"; do
       PROCESSED_FILES=$((PROCESSED_FILES + 1))
       continue
     fi
+
+    # A previous run may have finished the expensive encode and stopped while
+    # attaching its poster. Repair that output in place before re-encoding.
+    if ! has_attached_thumbnail "$output_file"; then
+      thumbnail_error_log="$dest_dir/.${base_noext}${OUTPUT_SUFFIX}.thumbnail-error.log"
+      if attach_thumbnail \
+        "$input_file" "$output_file" "$thumbnail_error_log" "$file_number"; then
+        fix_timestamps_and_metadata "$input_file" "$output_file"
+        if is_output_complete "$input_file" "$output_file"; then
+          actual_output_size=$(wc -c < "$output_file")
+          COMPLETED_INPUT_BYTES=$((COMPLETED_INPUT_BYTES + input_size))
+          COMPLETED_OUTPUT_BYTES=$((COMPLETED_OUTPUT_BYTES + actual_output_size))
+          COMPLETED_MEDIA_SECONDS=$((COMPLETED_MEDIA_SECONDS + duration))
+          PROCESSED_FILES=$((PROCESSED_FILES + 1))
+          render_postprocess_stage "$input_file" "$file_number" \
+            "Recovered — attached missing thumbnail"
+          continue
+        fi
+      else
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        render_postprocess_stage "$input_file" "$file_number" \
+          "Thumbnail repair failed — continuing batch"
+        echo -e "${RED}Thumbnail repair failed; file left incomplete.${NOCOLOR}" >&2
+        sed -n '1,120p' "$thumbnail_error_log" >&2
+        echo "Error log retained at: $thumbnail_error_log" >&2
+        continue
+      fi
+    fi
     echo -e "${RED}Re-encoding incomplete file...${NOCOLOR}"
   fi
 
@@ -776,7 +854,9 @@ for idx in "${!VIDEO_FILES[@]}"; do
         echo "Error log retained at: $error_log" >&2
         [[ -e "$stabilization_file" ]] &&
           echo "Stabilization data retained at: $stabilization_file" >&2
-        exit "$topaz_analysis_status"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        echo -e "${YELLOW}Continuing with the next queued file.${NOCOLOR}" >&2
+        continue
       fi
 
       topaz_stb_filter="${TOPAZ_STB_FILTER/__STAB_FILE__/$stabilization_file}"
@@ -826,10 +906,9 @@ for idx in "${!VIDEO_FILES[@]}"; do
       echo "Error log retained at: $error_log" >&2
       [[ -e "$stabilization_file" ]] &&
         echo "Stabilization data retained at: $stabilization_file" >&2
-      if [[ "$ffmpeg_status" -ne 0 ]]; then
-        exit "$ffmpeg_status"
-      fi
-      exit "$topaz_status"
+      FAILED_COUNT=$((FAILED_COUNT + 1))
+      echo -e "${YELLOW}Continuing with the next queued file.${NOCOLOR}" >&2
+      continue
     fi
     [[ "$USE_TOPAZ_STABILIZATION" == true ]] && rm -f "$stabilization_file"
   else
@@ -869,31 +948,25 @@ for idx in "${!VIDEO_FILES[@]}"; do
       echo -e "${RED}FFmpeg failed with status $ffmpeg_status.${NOCOLOR}" >&2
       sed -n '1,120p' "$error_log" >&2
       echo "Error log retained at: $error_log" >&2
-      exit "$ffmpeg_status"
+      FAILED_COUNT=$((FAILED_COUNT + 1))
+      echo -e "${YELLOW}Continuing with the next queued file.${NOCOLOR}" >&2
+      continue
     fi
   fi
   rm -f "$error_log"
 
-  # Add thumbnail as poster frame
-  # Extract first frame as JPEG
-  render_postprocess_stage "$input_file" "$file_number" "Generating thumbnail"
-  temp_thumb="${output_file%.mp4}_thumb.jpg"
-  "$ffmpeg_bin" -y -i "$input_file" -vframes 1 -q:v 2 "$temp_thumb" >/dev/null 2>&1
-  
-  # Re-mux with thumbnail as attached pic
-  if [[ -f "$temp_thumb" ]]; then
-    render_postprocess_stage "$input_file" "$file_number" "Attaching thumbnail"
-    temp_output="${output_file%.mp4}_temp.mp4"
-    "$ffmpeg_bin" -y -i "$output_file" -i "$temp_thumb" \
-      -map 0 -map 1 \
-      -c copy -tag:v:0 hvc1 -disposition:v:1 attached_pic \
-      -movflags +faststart \
-      "$temp_output" >/dev/null 2>&1
-    
-    if [[ -f "$temp_output" && -s "$temp_output" ]]; then
-      mv "$temp_output" "$output_file"
-    fi
-    rm -f "$temp_thumb" "$temp_output"
+  # Add thumbnail as poster frame. Failure is logged and the batch continues;
+  # validation deliberately leaves this file incomplete for a later repair.
+  thumbnail_error_log="$dest_dir/.${base_noext}${OUTPUT_SUFFIX}.thumbnail-error.log"
+  if ! attach_thumbnail \
+    "$input_file" "$output_file" "$thumbnail_error_log" "$file_number"; then
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+    render_postprocess_stage "$input_file" "$file_number" \
+      "Thumbnail failed — continuing batch"
+    echo -e "${RED}Thumbnail generation/remux failed for: $output_file${NOCOLOR}" >&2
+    sed -n '1,120p' "$thumbnail_error_log" >&2
+    echo "Error log retained at: $thumbnail_error_log" >&2
+    continue
   fi
 
   # Metadata/timestamps - must be done AFTER all file modifications
